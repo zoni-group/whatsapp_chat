@@ -11,6 +11,32 @@ function display_name(conversation) {
   return conversation.full_name || conversation.username || conversation.igsid;
 }
 
+// Instagram withholds the content of some messages entirely — GIPHYs, voice notes,
+// vanish-mode photos, shares from private accounts. There is nothing to render, so
+// the bubble has to say what was withheld rather than apologise generically.
+function instagram_placeholder(message) {
+  const labels = {
+    sticker: __("Sticker"),
+    ephemeral: __("Disappearing photo"),
+    story_mention: __("Story mention"),
+    story_reply: __("Story reply"),
+    share: __("Shared post"),
+    reel: __("Shared reel"),
+    image: __("Photo"),
+    video: __("Video"),
+    audio: __("Audio"),
+    file: __("Document"),
+    unsupported: __("Instagram could not deliver this message"),
+  };
+  // The backend names the withheld thing in attachment_error; it is more specific
+  // than anything derivable from message_type alone, so it wins when present.
+  return (
+    message.attachment_error ||
+    labels[message.message_type] ||
+    `[${message.message_type}]`
+  );
+}
+
 export default class InstagramPanel {
   constructor(opts) {
     this.$wrapper = opts.$wrapper;
@@ -276,6 +302,10 @@ export default class InstagramPanel {
   }
 
   async load_messages(before = null) {
+    // A realtime event can land between open_conversation() setting this.active
+    // and render_thread() building this.$thread, so neither is safe to assume.
+    const conversation = this.active;
+    if (!conversation || !this.$thread) return;
     const $container = this.$thread.find(".instagram-messages");
     const previous_height =
       before && $container.length ? $container[0].scrollHeight : 0;
@@ -283,9 +313,12 @@ export default class InstagramPanel {
       before && $container.length ? $container.scrollTop() : 0;
     try {
       const result = await instagram_call("list_messages", {
-        conversation: this.active.name,
+        conversation: conversation.name,
         before,
       });
+      // The user may have switched threads or gone back to the list while the
+      // request was in flight; those messages no longer belong on screen.
+      if (this.active !== conversation || !this.$thread) return;
       this.message_cursor = result.next_cursor;
       this.messages = before
         ? [...(result.items || []), ...(this.messages || [])]
@@ -394,12 +427,10 @@ export default class InstagramPanel {
     } else if (message.attachment_status === "Pending") {
       $bubble.addClass("text-muted").text(__("Attachment processing…"));
     } else if (["Failed", "Skipped"].includes(message.attachment_status)) {
-      $bubble
-        .addClass("text-muted")
-        .text(message.attachment_error || __("Attachment unavailable"));
+      $bubble.addClass("text-muted").text(instagram_placeholder(message));
     } else if (
       message.media_url &&
-      ["image", "story_mention", "story_reply", "share", "reel"].includes(
+      ["image", "story_mention", "story_reply", "share", "reel", "sticker"].includes(
         message.message_type,
       )
     ) {
@@ -451,13 +482,11 @@ export default class InstagramPanel {
           })
           .text(__("View shared Instagram post")),
       );
+    } else if (message.message) {
+      // The default branch for a plain text body — there is no earlier `text` case.
+      $bubble.text(message.message);
     } else {
-      const fallback =
-        message.message ||
-        (message.message_type === "unsupported"
-          ? __("Unsupported Instagram message")
-          : `[${message.message_type}]`);
-      $bubble.text(fallback);
+      $bubble.addClass("text-muted").text(instagram_placeholder(message));
     }
     if (message.reply_to_message_id)
       $bubble.prepend(
@@ -681,20 +710,31 @@ export default class InstagramPanel {
   }
 
   async send_file(file, is_voice_note) {
+    const mime = (file.type || "").toLowerCase();
+    const type =
+      is_voice_note || mime.startsWith("audio/")
+        ? "audio"
+        : mime.startsWith("video/")
+          ? "video"
+          : "image";
     try {
+      // Instagram rejects oversized media anyway, so fail here rather than
+      // after pushing the whole body up to the server.
+      const limit = ((this.config.limits || {}).media || {})[type];
+      if (limit && file.size > limit) {
+        throw new Error(
+          __("This {0} is larger than Instagram's {1} MB limit.", [
+            type,
+            Math.floor(limit / (1024 * 1024)),
+          ]),
+        );
+      }
       const uploaded = await upload_chat_file(
         file,
         "Instagram Conversation",
         this.active.name,
         true,
       );
-      const mime = (file.type || "").toLowerCase();
-      const type =
-        is_voice_note || mime.startsWith("audio/")
-          ? "audio"
-          : mime.startsWith("video/")
-            ? "video"
-            : "image";
       await instagram_call(
         "send_attachment",
         {
